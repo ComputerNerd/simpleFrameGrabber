@@ -1,0 +1,2 @@
+#!/bin/sh
+./grab 160 120 yuv422 500000 /dev/ttyACM0 0
