@@ -19,7 +19,9 @@
 #include <errno.h>   /* Error number definitions */
 #include <termios.h> /* POSIX terminal control definitions */
 #include <stdint.h>
+#ifdef __linux__
 #include <linux/serial.h>
+#endif
 #include <sys/ioctl.h>
 #include <SDL/SDL.h>
 #define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
@@ -261,10 +263,12 @@ int main(int argc,char**argv){
 	tcsetattr(fd, TCSANOW, &options);
 	tcflush(fd,TCIOFLUSH);
 	sleep(1);
+#ifdef __linux__
 	{struct serial_struct serinfo;
 	ioctl (fd, TIOCGSERIAL, &serinfo);
 	serinfo.flags |= ASYNC_LOW_LATENCY;
 	ioctl (fd, TIOCSSERIAL, &serinfo);}
+#endif
 	uint8_t tmpBuf[4];
 	int exitLoop=1;
 	fpsinit();
