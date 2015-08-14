@@ -1,2 +1,2 @@
 #!/bin/sh
-gcc main.c -Wall -O2 -o grab -lSDL
+gcc main.c -Wall -O2 -o grab -lSDL -ljpeg

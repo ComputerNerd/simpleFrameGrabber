@@ -24,6 +24,8 @@
 #endif
 #include <sys/ioctl.h>
 #include <SDL/SDL.h>
+#include <jpeglib.h>
+#include <setjmp.h>
 #define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
 
 // RGB -> YUV
@@ -72,6 +74,7 @@ static void fpsinit(){
 	framespersecond = 0;
 	frametimelast = SDL_GetTicks();
 }
+
 
 static void fpsthink(){
 	uint32_t frametimesindex;
@@ -157,7 +160,7 @@ static void waitImg(int fd){
 	if(junkC)
 		printf("%d junk bytes skipped\n",junkC);
 }
-enum COLORSPACE{RGB565,YUV422,RAW};
+enum COLORSPACE{RGB565,YUV422,RAW,JPEG};
 struct baudDef{
 	const char*str;
 	speed_t baudRate;
@@ -194,6 +197,54 @@ static const struct baudDef baudTab[]={
 	{"3500000",B3500000},
 	{"4000000",B4000000}
 };
+static void*getJpeg(int fd,size_t*size){
+	uint8_t*ptr=0;
+	size_t sz=0;
+	int look=0;
+	for(;;){
+		uint8_t b;
+		readC(fd,&b,1);
+		ptr=realloc(ptr,++sz);
+		ptr[sz-1]=b;
+		if(look){
+			if(b==0xD9)
+				break;
+			else
+				look=0;
+		}
+		if(b==0xFF)
+			look=1;
+	}
+	if(size)
+		*size=sz;
+	printf("Size: %u\n",sz);
+	return ptr;
+}
+struct my_error_mgr {
+	struct jpeg_error_mgr pub;    /* "public" fields */
+
+	jmp_buf setjmp_buffer;        /* for return to caller */
+};
+
+typedef struct my_error_mgr * my_error_ptr;
+
+/*
+ * Here's the routine that will replace the standard error_exit method:
+ */
+
+METHODDEF(void)
+my_error_exit (j_common_ptr cinfo)
+{
+	/* cinfo->err really points to a my_error_mgr struct, so coerce pointer */
+	my_error_ptr myerr = (my_error_ptr) cinfo->err;
+
+	/* Always display the message. */
+	/* We could postpone this until after returning, if we chose. */
+	(*cinfo->err->output_message) (cinfo);
+
+	/* Return control to the setjmp point */
+	longjmp(myerr->setjmp_buffer, 1);
+}
 int main(int argc,char**argv){
 	if(argc!=7){
 		printf("Usage:\n%s width height colorspace baudrate deviceLocation protocolVersion\nValid colorspace options rgb565,yuv422,raw\nValid protocol options 0,1\n",argv[0]);
@@ -216,6 +267,8 @@ int main(int argc,char**argv){
 		colspace=YUV422;
 	else if(strcmp(argv[3],"raw")==0)
 		colspace=RAW;
+	else if(strcmp(argv[3],"jpeg")==0)
+		colspace=JPEG;
 	else{
 		puts("Invalid colorspace");
 		return 1;
@@ -272,139 +325,272 @@ int main(int argc,char**argv){
 	uint8_t tmpBuf[4];
 	int exitLoop=1;
 	fpsinit();
-
+	if(colspace==JPEG){
+		uint8_t*first=getJpeg(fd,NULL);//Skip partial frame
+		free(first);
+	}
 	while(exitLoop){
 		SDL_LockSurface(image);
 		uint8_t*imgPtr=image->pixels;
-		unsigned x,y,saveImg=0;
-		waitImg(fd);
-		if(protocolVersion){
-			uint16_t ln;
-			readC(fd,&ln,2);
-			//++ln;
-			ln%=height;
-			ln=height-ln;
-			printf("%d\n",ln);
-			imgPtr=image->pixels+(image->pitch*ln);
-		}
-		static int clk=63;
-		printf("Div %d\n",clk--);
-		for(y=0;y<height;++y){
-			for(x=0;x<width;++x){
-				{
-					int rdAmt,n;
-					switch(colspace){
-						case RGB565:
-							rdAmt=2;
-						break;
-						case YUV422:
-							if(x&1)
-								continue;
-							rdAmt=4;
-						break;
-						case RAW:
-							rdAmt=1;
-						break;
-					}
-					n = readC(fd,tmpBuf,rdAmt);
-					if (n < rdAmt)
-						printf("Read %d bytes instead of 4\n",n);
-					if (n ==0){
-						puts("0 bytes read");
-						continue;
-					}
-				}
-				switch(colspace){
-					case RGB565:
-						*imgPtr++=tmpBuf[0];
-						*imgPtr++=tmpBuf[1];
-					break;
-					case YUV422:
-						*imgPtr++=YUV2R(tmpBuf[1],tmpBuf[0],tmpBuf[2]);
-						*imgPtr++=YUV2G(tmpBuf[1],tmpBuf[0],tmpBuf[2]);
-						*imgPtr++=YUV2B(tmpBuf[1],tmpBuf[0],tmpBuf[2]);
+		unsigned x,y=0,saveImg=0;
+		if(!protocolVersion)
+			waitImg(fd);
+		size_t sz;
+		uint8_t*jpg=0;
+		if(colspace==JPEG){
+			jpg=getJpeg(fd,&sz);
+			printf("Jpeg grabbed size: %u\n",sz);
 
-						*imgPtr++=YUV2R(tmpBuf[3],tmpBuf[0],tmpBuf[2]);
-						*imgPtr++=YUV2G(tmpBuf[3],tmpBuf[0],tmpBuf[2]);
-						*imgPtr++=YUV2B(tmpBuf[3],tmpBuf[0],tmpBuf[2]);
-					break;
-					case RAW:
-						//see what color this pixel should set to
-						/*B G
-			  			G R*/ 
-						if(y&1){//odd
-							if(x&1)//if odd
-								imgPtr[0]=tmpBuf[0];//red
-							else
-								imgPtr[1]=tmpBuf[0];//green
-						}else{//even
-							if (x&1)//if odd pixel
-								imgPtr[1]=tmpBuf[0];//green
-							else
-								imgPtr[2]=tmpBuf[0];//blue
-						}
-						imgPtr+=3;//next pixel
-					break;
-				}
-			}
-			if((colspace==RAW)&&(y&1)){
-				//do bayer interpolation
-				imgPtr=image->pixels+((y-1)*image->pitch);
-				unsigned wx;
-				for(wx=0;wx<width;wx+=2){
-					//this will do a 2x2 pixel rectangle
-					/*B G
-					  G R*/ 
-					imgPtr[wx*3]=imgPtr[((width+wx)*3)+3];//red
-					imgPtr[1+wx*3]=imgPtr[4+wx*3];//green
+			/* This struct contains the JPEG decompression parameters and pointers to
+			 * working space (which is allocated as needed by the JPEG library).
+			 */
+			struct jpeg_decompress_struct cinfo;
+			struct my_error_mgr jerr;
+			/* We use our private extension JPEG error handler.
+			 * Note that this struct must live as long as the main JPEG parameter
+			 * struct, to avoid dangling-pointer problems.
+			 */
+			/* More stuff */
+			int row_stride;               /* physical row width in output buffer */
 
-					imgPtr[3+wx*3]=imgPtr[((width+wx)*3)+3];//red
-					imgPtr[5+wx*3]=imgPtr[wx*3+2];//blue
 
-					imgPtr[((width+wx)*3)]=imgPtr[((width+wx)*3)+3];//red
-					imgPtr[((width+wx)*3)+2]=imgPtr[wx*3+2];//blue
+			/* Step 1: allocate and initialize JPEG decompression object */
 
-					imgPtr[((width+wx)*3)+5]=imgPtr[wx*3+2];//blue
-					imgPtr[((width+wx)*3)+4]=imgPtr[((width+wx)*3)+1];//green
-				}
-				imgPtr=image->pixels+(y*image->pitch);
+
+			/* We set up the normal JPEG error routines, then override error_exit. */
+			cinfo.err = jpeg_std_error(&jerr.pub);
+			jerr.pub.error_exit = my_error_exit;
+			/* Establish the setjmp return context for my_error_exit to use. */
+			if (setjmp(jerr.setjmp_buffer)) {
+				/* If we get here, the JPEG code has signaled an error.
+				 * We need to clean up the JPEG object, close the input file, and return.
+				 */
+				jpeg_destroy_decompress(&cinfo);
+				return 0;
 			}
-			if(!(y&15)){
-				SDL_UnlockSurface(image);
-				SDL_BlitSurface(image, NULL, screen, NULL );
-				SDL_LockSurface(image);
-				SDL_Flip(screen);
+			/* Now we can initialize the JPEG compression object. */
+			jpeg_create_compress(&cinfo);
+			/* Now we can initialize the JPEG decompression object. */
+			jpeg_create_decompress(&cinfo);
+
+			/* Step 2: specify data source (eg, a file) */
+
+			jpeg_mem_src(&cinfo,jpg,sz);
+
+			/* Step 3: read file parameters with jpeg_read_header() */
+
+			(void) jpeg_read_header(&cinfo, TRUE);
+			/* We can ignore the return value from jpeg_read_header since
+			 *   (a) suspension is not possible with the stdio data source, and
+			 *   (b) we passed TRUE to reject a tables-only JPEG file as an error.
+			 * See libjpeg.txt for more info.
+			 */
+
+			/* Step 4: set parameters for decompression */
+
+			/* In this example, we don't need to change any of the defaults set by
+			 * jpeg_read_header(), so we do nothing here.
+			 */
+
+			/* Step 5: Start decompressor */
+
+			(void) jpeg_start_decompress(&cinfo);
+			/* We can ignore the return value since suspension is not possible
+			 * with the stdio data source.
+			 */
+
+			/* We may need to do some setup of our own at this point before reading
+			 * the data.  After jpeg_start_decompress() we have the correct scaled
+			 * output image dimensions available, as well as the output colormap
+			 * if we asked for color quantization.
+			 * In this example, we need to make an output work buffer of the right size.
+			 */
+			/* JSAMPLEs per row in output buffer */
+			row_stride = cinfo.output_width * cinfo.output_components;
+			/* Make a one-row-high sample array that will go away when done with image */
+
+			/* Step 6: while (scan lines remain to be read) */
+			/*           jpeg_read_scanlines(...); */
+
+			/* Here we use the library's state variable cinfo.output_scanline as the
+			 * loop counter, so that we don't have to keep track ourselves.
+			 */
+			JSAMPROW row_pointer[1];
+  			JSAMPARRAY buffer;            /* Output row buffer */
+			buffer = (*cinfo.mem->alloc_sarray)
+				((j_common_ptr) &cinfo, JPOOL_IMAGE, row_stride, 1);
+
+			/* Step 6: while (scan lines remain to be read) */
+			/*           jpeg_read_scanlines(...); */
+
+			/* Here we use the library's state variable cinfo.output_scanline as the
+			 * loop counter, so that we don't have to keep track ourselves.
+			 */
+			while (cinfo.output_scanline < cinfo.output_height) {
+				/* jpeg_read_scanlines expects an array of pointers to scanlines.
+				 * Here the array is only one element long, but you could ask for
+				 * more than one scanline at a time if that's more convenient.
+				 */
+				(void) jpeg_read_scanlines(&cinfo, buffer, 1);
+				/* Assume put_scanline_someplace wants a pointer and sample count. */
+				//put_scanline_someplace(buffer[0], row_stride);
+				memcpy(image->pixels+(y*width*3),buffer[0],width*3);
+				++y;
 			}
-			while(SDL_PollEvent(&event)){
-				if(event.type==SDL_QUIT){
-					//Quit the program
-					exitLoop=0;
-					goto quit;
-				}
-				if(event.type == SDL_KEYDOWN){
-					if(event.key.keysym.sym == SDLK_s){
-						puts("Saving Image");
-						saveImg=1;
-					}
-				}
-			}
-			if(y<height-1){
+
+			/* Step 7: Finish decompression */
+
+			(void) jpeg_finish_decompress(&cinfo);
+			/* We can ignore the return value since suspension is not possible
+			 * with the stdio data source.
+			 */
+
+			/* Step 8: Release JPEG decompression object */
+
+			/* This is an important step since it will release a good deal of memory. */
+			jpeg_destroy_decompress(&cinfo);
+
+			/* After finish_decompress, we can close the input file.
+			 * Here we postpone it until after no more JPEG errors are possible,
+			 * so as to simplify the setjmp error logic above.  (Actually, I don't
+			 * think that jpeg_destroy can do an error exit, but why assume anything...)
+			 */
+
+
+		}else{
+			for(y=0;y<height;++y){
 				if(protocolVersion){
 					waitImg(fd);
 					uint16_t ln;
 					readC(fd,&ln,2);
 					ln%=height;
-					ln=height-ln;
-					printf("%d\n",ln);
+					//printf("%d\n",ln);
 					y=ln;
 					imgPtr=image->pixels+(image->pitch*ln);
+				}
+				for(x=0;x<width;++x){
+					{
+						int rdAmt,n;
+						switch(colspace){
+							case RGB565:
+								rdAmt=2;
+							break;
+							case YUV422:
+								if(x&1)
+									continue;
+								rdAmt=4;
+							break;
+							case RAW:
+								rdAmt=1;
+							break;
+						}
+						n = readC(fd,tmpBuf,rdAmt);
+						if (n < rdAmt)
+							printf("Read %d bytes instead of 4\n",n);
+						if (n ==0){
+							puts("0 bytes read");
+							continue;
+						}
+					}
+					switch(colspace){
+						case RGB565:
+							*imgPtr++=tmpBuf[0];
+							*imgPtr++=tmpBuf[1];
+						break;
+						case YUV422:
+							*imgPtr++=YUV2R(tmpBuf[1],tmpBuf[0],tmpBuf[2]);
+							*imgPtr++=YUV2G(tmpBuf[1],tmpBuf[0],tmpBuf[2]);
+							*imgPtr++=YUV2B(tmpBuf[1],tmpBuf[0],tmpBuf[2]);
+
+							*imgPtr++=YUV2R(tmpBuf[3],tmpBuf[0],tmpBuf[2]);
+							*imgPtr++=YUV2G(tmpBuf[3],tmpBuf[0],tmpBuf[2]);
+							*imgPtr++=YUV2B(tmpBuf[3],tmpBuf[0],tmpBuf[2]);
+						break;
+						case RAW:
+							//see what color this pixel should set to
+							/*B G
+							G R*/ 
+							if(y&1){//odd
+								if(x&1)//if odd
+									imgPtr[0]=tmpBuf[0];//red
+								else
+									imgPtr[1]=tmpBuf[0];//green
+							}else{//even
+								if (x&1)//if odd pixel
+									imgPtr[1]=tmpBuf[0];//green
+								else
+									imgPtr[2]=tmpBuf[0];//blue
+							}
+							imgPtr+=3;//next pixel
+						break;
+					}
+				}
+				if((colspace==RAW)&&(y&1)){
+					//do bayer interpolation
+					imgPtr=image->pixels+((y-1)*image->pitch);
+					unsigned wx;
+					for(wx=0;wx<width;wx+=2){
+						//this will do a 2x2 pixel rectangle
+						/*B G
+						  G R*/ 
+						imgPtr[wx*3]=imgPtr[((width+wx)*3)+3];//red
+						imgPtr[1+wx*3]=imgPtr[4+wx*3];//green
+
+						imgPtr[3+wx*3]=imgPtr[((width+wx)*3)+3];//red
+						imgPtr[5+wx*3]=imgPtr[wx*3+2];//blue
+
+						imgPtr[((width+wx)*3)]=imgPtr[((width+wx)*3)+3];//red
+						imgPtr[((width+wx)*3)+2]=imgPtr[wx*3+2];//blue
+
+						imgPtr[((width+wx)*3)+5]=imgPtr[wx*3+2];//blue
+						imgPtr[((width+wx)*3)+4]=imgPtr[((width+wx)*3)+1];//green
+					}
+					imgPtr=image->pixels+(y*image->pitch);
+				}
+				if(!(y&15)){
+					SDL_UnlockSurface(image);
+					SDL_BlitSurface(image, NULL, screen, NULL );
+					SDL_LockSurface(image);
+					SDL_Flip(screen);
+				}
+				while(SDL_PollEvent(&event)){
+					if(event.type==SDL_QUIT){
+						//Quit the program
+						exitLoop=0;
+						goto quit;
+					}
+					if(event.type == SDL_KEYDOWN){
+						if(event.key.keysym.sym == SDLK_s){
+							puts("Saving Image");
+							saveImg=1;
+						}
+					}
+				}
+			}
+		}
+		while(SDL_PollEvent(&event)){
+			if(event.type==SDL_QUIT){
+				//Quit the program
+				exitLoop=0;
+				goto quit;
+			}
+			if(event.type == SDL_KEYDOWN){
+				if(event.key.keysym.sym == SDLK_s){
+					puts("Saving Image");
+					saveImg=1;
 				}
 			}
 		}
 		if(saveImg){
 			saveImg=0;
+			if(colspace==JPEG&&jpg){
+				FILE*fp=fopen("OUT.jpg","wb");
+				fwrite(jpg,sz,1,fp);
+				fclose(fp);
+			}else
 			SDL_SaveBMP(image,"OUT.bmp");
 		}
+		free(jpg);
 quit:
 		SDL_UnlockSurface(image);
 		SDL_BlitSurface(image, NULL, screen, NULL );
