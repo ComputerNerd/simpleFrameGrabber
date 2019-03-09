@@ -26,6 +26,8 @@
 #include <SDL/SDL.h>
 #include <jpeglib.h>
 #include <setjmp.h>
+#include "endian.h"
+#include "byte-consts.h"
 #define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
 
 // RGB -> YUV
@@ -217,7 +219,7 @@ static void*getJpeg(int fd,size_t*size){
 	}
 	if(size)
 		*size=sz;
-	printf("Size: %u\n",sz);
+	printf("Size: %zu\n",sz);
 	return ptr;
 }
 struct my_error_mgr {
@@ -245,7 +247,7 @@ my_error_exit (j_common_ptr cinfo)
 	/* Return control to the setjmp point */
 	longjmp(myerr->setjmp_buffer, 1);
 }
-int main(int argc,char**argv){
+int main(int argc, char** argv){
 	if(argc!=7){
 		printf("Usage:\n%s width height colorspace baudrate deviceLocation protocolVersion\nValid colorspace options rgb565,yuv422,raw\nValid protocol options 0,1\n",argv[0]);
 		return 1;
@@ -286,9 +288,9 @@ int main(int argc,char**argv){
 		}
 	}
 	int protocolVersion=atoi(argv[6]);
-	printf("%d %d %d %d %d\n",width,height,colspace,baudRate,protocolVersion);
+	printf("%d %d %d %zu %d\n",width,height,colspace,baudRate,protocolVersion);
 	SDL_Surface* screen = NULL;
-	SDL_Surface*image;
+	SDL_Surface* image;
 	if(colspace==RGB565)
 		image = SDL_CreateRGBSurface(SDL_SWSURFACE,width,height,16,be16toh(0xF800),be16toh(0x07e0),be16toh(0x1F),0);
 	else
@@ -339,7 +341,7 @@ int main(int argc,char**argv){
 		uint8_t*jpg=0;
 		if(colspace==JPEG){
 			jpg=getJpeg(fd,&sz);
-			printf("Jpeg grabbed size: %u\n",sz);
+			printf("Jpeg grabbed size: %zu\n",sz);
 
 			/* This struct contains the JPEG decompression parameters and pointers to
 			 * working space (which is allocated as needed by the JPEG library).
