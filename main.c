@@ -26,8 +26,10 @@
 #include <SDL/SDL.h>
 #include <jpeglib.h>
 #include <setjmp.h>
+#ifdef __APPLE__
 #include "endian.h"
 #include "byte-consts.h"
+#endif
 #define CLIP(X) ( (X) > 255 ? 255 : (X) < 0 ? 0 : X)
 
 // RGB -> YUV
